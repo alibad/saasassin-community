@@ -1,0 +1,938 @@
+import { z } from "zod";
+
+/**
+ * SaaSassin Community domain model — pure logic only (no Firestore, no server-only),
+ * so every rule here is unit-tested in tests/community-*.test.ts.
+ */
+
+export const COMMUNITY_SLUG = "community";
+export const EXPORT_SCHEMA_VERSION = "1.0.0";
+
+export const COMMUNITY_ROLES = ["owner", "admin", "moderator", "member"] as const;
+export type CommunityRole = (typeof COMMUNITY_ROLES)[number] | (string & {});
+
+export const MANAGER_ROLES: CommunityRole[] = ["owner", "admin"];
+export const MODERATOR_ROLES: CommunityRole[] = ["owner", "admin", "moderator"];
+
+export const SPACE_KINDS = ["discussion", "announcements", "events"] as const;
+export type SpaceKind = (typeof SPACE_KINDS)[number];
+export const SPACE_VISIBILITIES = ["members", "private"] as const;
+export type SpaceVisibility = (typeof SPACE_VISIBILITIES)[number];
+
+export const REACTION_TYPES = ["like", "celebrate", "insightful"] as const;
+export type ReactionType = (typeof REACTION_TYPES)[number];
+export const REACTION_LABELS: Record<ReactionType, string> = { like: "Like", celebrate: "Celebrate", insightful: "Insightful" };
+
+export const RSVP_STATUSES = ["going", "maybe", "not_going"] as const;
+export type RsvpStatus = (typeof RSVP_STATUSES)[number];
+
+export type Space = {
+  id: string;
+  name: string;
+  description: string;
+  kind: SpaceKind;
+  visibility: SpaceVisibility;
+  memberUids: string[];
+  /** Private spaces can also open to whole cohorts. */
+  cohortIds?: string[];
+  order: number;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type CommunityEvent = { startsAt: string; endsAt: string | null; location: string };
+
+export type Post = {
+  id: string;
+  spaceId: string;
+  authorUid: string;
+  authorName: string;
+  title: string;
+  body: string;
+  event: CommunityEvent | null;
+  pinned: boolean;
+  commentsClosed: boolean;
+  removed: boolean;
+  removedReason: string | null;
+  mentions: string[];
+  reactionCounts: Partial<Record<ReactionType, number>>;
+  commentCount: number;
+  /** Set once every comment on the post carries a thread key (see threadKey). */
+  threadKeyed?: boolean;
+  createdAt: string;
+};
+
+export type Comment = {
+  id: string;
+  postId: string;
+  spaceId: string;
+  authorUid: string;
+  authorName: string;
+  body: string;
+  mentions: string[];
+  removed: boolean;
+  threadKey?: string;
+  createdAt: string;
+};
+
+export type Profile = {
+  uid: string;
+  displayName: string;
+  headline: string;
+  bio: string;
+  notificationsReadAt: string | null;
+  handle?: string | null;
+  handleChangedAt?: string | null;
+};
+
+export type Member = { uid: string; email: string; name: string; role: CommunityRole; status: string };
+
+/** The name other members see. Never derived from an email address. */
+export function publicName(profile: Pick<Profile, "displayName"> | null | undefined, accountName?: string | null) {
+  return profile?.displayName?.trim() || accountName?.trim() || "Member";
+}
+
+export function isManager(role: CommunityRole) {
+  return MANAGER_ROLES.includes(role);
+}
+
+export function isModerator(role: CommunityRole) {
+  return MODERATOR_ROLES.includes(role);
+}
+
+/* ------------------------------------------------------------------ visibility */
+
+/**
+ * A viewer is a member plus the private spaces their active plan entitlements unlock.
+ * `spaceGrants` is always derived server-side from entitlement records, never from the browser.
+ */
+export type Viewer = { uid: string; role: CommunityRole; spaceGrants?: string[]; cohortIds?: string[] };
+
+/** Owners/admins see every space; "members" spaces are open to all members; private spaces need an explicit grant, a plan, or a cohort. */
+export function canSeeSpace(space: Pick<Space, "visibility" | "memberUids"> & { id?: string; cohortIds?: string[] }, viewer: Viewer) {
+  if (isManager(viewer.role)) return true;
+  if (space.visibility === "members") return true;
+  if (space.memberUids.includes(viewer.uid)) return true;
+  if (space.cohortIds?.some((cohortId) => viewer.cohortIds?.includes(cohortId))) return true;
+  return Boolean(space.id && viewer.spaceGrants?.includes(space.id));
+}
+
+/* ------------------------------------------------------------------ cohorts + drip */
+
+export type Cohort = { id: string; name: string; startsAt: string; memberUids: string[]; createdAt: string };
+
+const DAY_MS = 86_400_000;
+
+export type LessonAccess = { unlocked: boolean; unlocksAt: string | null; reason: "open" | "scheduled" | "no_cohort" };
+
+/**
+ * Drip by cohort start: with drip on, lesson N unlocks `unlockDay` days after the member's cohort starts
+ * (their earliest cohort if they are in several). Day-0 lessons are always open. A member in no cohort
+ * sees only day-0 lessons. Managers always see everything so they can author and preview.
+ */
+export function lessonSchedule(
+  course: Pick<Course, "lessons" | "dripByCohort">,
+  memberCohortStarts: string[],
+  now: Date,
+  manager: boolean,
+): Record<string, LessonAccess> {
+  const anchor = [...memberCohortStarts].sort()[0] ?? null;
+  return Object.fromEntries(
+    course.lessons.map((lesson) => {
+      const day = Math.max(0, Math.floor(lesson.unlockDay ?? 0));
+      if (manager || !course.dripByCohort || day === 0) return [lesson.id, { unlocked: true, unlocksAt: null, reason: "open" as const }];
+      if (!anchor) return [lesson.id, { unlocked: false, unlocksAt: null, reason: "no_cohort" as const }];
+      const unlocksAt = new Date(Date.parse(anchor) + day * DAY_MS).toISOString();
+      return [lesson.id, { unlocked: now.toISOString() >= unlocksAt, unlocksAt, reason: "scheduled" as const }];
+    }),
+  );
+}
+
+/** Locked lessons travel to members without their content. */
+export function redactLockedLessons<T extends Pick<Course, "lessons">>(
+  course: T,
+  schedule: Record<string, LessonAccess>,
+): Omit<T, "lessons"> & { lessons: Array<Lesson & { access: LessonAccess }> } {
+  return {
+    ...course,
+    lessons: course.lessons.map((lesson) => {
+      const access = schedule[lesson.id] ?? { unlocked: true, unlocksAt: null, reason: "open" as const };
+      return { ...lesson, body: access.unlocked ? lesson.body : "", access };
+    }),
+  };
+}
+
+const dateOnly = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}(T.*)?$/, "Pick a start date.")
+  .refine((value) => !Number.isNaN(Date.parse(value)), "Pick a valid start date.")
+  .transform((value) => new Date(value.length === 10 ? `${value}T00:00:00.000Z` : value).toISOString());
+
+/* ------------------------------------------------------------------ plans + entitlements */
+
+export type Plan = {
+  id: string;
+  name: string;
+  description: string;
+  priceLabel: string;
+  spaceIds: string[];
+  createdAt: string;
+  updatedAt?: string | null;
+  /** Archived plans never grant new access. What happens to existing holders is the admin's explicit choice. */
+  archived?: boolean;
+  archivedAt?: string | null;
+  existingAccess?: PlanArchiveChoice | null;
+};
+
+export const PLAN_ARCHIVE_CHOICES = ["keep", "revoke"] as const;
+export type PlanArchiveChoice = (typeof PLAN_ARCHIVE_CHOICES)[number];
+
+/** A plan can be granted only while it is not archived. */
+export function canGrantPlan(plan: Pick<Plan, "archived">) {
+  return plan.archived !== true;
+}
+
+/** Whether an active entitlement to this plan still unlocks spaces: always while live; after archiving only if the admin chose "keep". */
+export function planGrantsAccess(plan: Pick<Plan, "archived" | "existingAccess">) {
+  return plan.archived !== true || plan.existingAccess === "keep";
+}
+
+/** The fields an edit actually changed, for an audit record that says what moved. */
+export function planChanges(before: Pick<Plan, "name" | "description" | "priceLabel" | "spaceIds">, after: Pick<Plan, "name" | "description" | "priceLabel" | "spaceIds">) {
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+  for (const key of ["name", "description", "priceLabel"] as const) {
+    if (before[key] !== after[key]) changes[key] = { from: before[key], to: after[key] };
+  }
+  const beforeSpaces = [...before.spaceIds].sort();
+  const afterSpaces = [...after.spaceIds].sort();
+  if (beforeSpaces.join("|") !== afterSpaces.join("|")) changes.spaceIds = { from: beforeSpaces, to: afterSpaces };
+  return changes;
+}
+
+export type EntitlementEvent = {
+  id: string;
+  planId: string;
+  uid: string;
+  type: "granted" | "revoked";
+  source: "manual" | "checkout" | "plan_archived";
+  reason: string;
+  actorUid: string;
+  at: string;
+};
+
+export function entitlementDocId(planId: string, uid: string) {
+  return `${planId}__${uid}`;
+}
+
+/** Replays the immutable entitlement log into the current set of active `planId__uid` grants. */
+export function replayEntitlements(events: Pick<EntitlementEvent, "planId" | "uid" | "type" | "at" | "id">[]) {
+  const ordered = [...events].sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id));
+  const active = new Set<string>();
+  for (const event of ordered) {
+    const key = entitlementDocId(event.planId, event.uid);
+    if (event.type === "granted") active.add(key);
+    else active.delete(key);
+  }
+  return active;
+}
+
+/** Private spaces unlocked for a member by their active plans. */
+export function spaceGrantsFor(uid: string, plans: Pick<Plan, "id" | "spaceIds" | "archived" | "existingAccess">[], activeEntitlements: Set<string>) {
+  return [
+    ...new Set(plans.filter((plan) => planGrantsAccess(plan) && activeEntitlements.has(entitlementDocId(plan.id, uid))).flatMap((plan) => plan.spaceIds)),
+  ];
+}
+
+/** Announcements are broadcast-only: moderators and managers post, members read and comment. */
+export function canPostInSpace(space: Pick<Space, "kind" | "visibility" | "memberUids"> & { id?: string }, viewer: Viewer) {
+  if (!canSeeSpace(space, viewer)) return false;
+  if (space.kind === "announcements") return isModerator(viewer.role);
+  return true;
+}
+
+export function visibleSpaces<T extends Pick<Space, "visibility" | "memberUids" | "order" | "name">>(
+  spaces: T[],
+  viewer: Viewer,
+) {
+  return sortSpaces(spaces.filter((space) => canSeeSpace(space, viewer)));
+}
+
+export function sortSpaces<T extends Pick<Space, "order" | "name">>(spaces: T[]) {
+  return [...spaces].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+}
+
+/** Swap a space with its neighbour and renumber 0..n so the order never drifts. */
+export function moveSpace<T extends Pick<Space, "id" | "order" | "name">>(spaces: T[], spaceId: string, direction: "up" | "down") {
+  const sorted = sortSpaces(spaces);
+  const index = sorted.findIndex((space) => space.id === spaceId);
+  if (index < 0) return sorted.map((space, order) => ({ ...space, order }));
+  const target = direction === "up" ? index - 1 : index + 1;
+  if (target >= 0 && target < sorted.length) {
+    [sorted[index], sorted[target]] = [sorted[target], sorted[index]];
+  }
+  return sorted.map((space, order) => ({ ...space, order }));
+}
+
+/* ------------------------------------------------------------------ feed */
+
+export type FeedOptions = { spaceId?: string; limit?: number; includeRemoved?: boolean };
+
+/**
+ * Server-side feed assembly: only posts from spaces the viewer can see, removed content
+ * hidden unless the viewer moderates, newest first. In a single space, pinned posts lead.
+ */
+export function assembleFeed(
+  posts: Post[],
+  spaces: Space[],
+  viewer: Viewer,
+  options: FeedOptions = {},
+) {
+  const visible = new Set(spaces.filter((space) => canSeeSpace(space, viewer)).map((space) => space.id));
+  const showRemoved = options.includeRemoved === true && isModerator(viewer.role);
+  const filtered = posts.filter(
+    (post) =>
+      visible.has(post.spaceId) &&
+      (!options.spaceId || post.spaceId === options.spaceId) &&
+      (showRemoved || !post.removed),
+  );
+  filtered.sort((a, b) => {
+    if (options.spaceId && a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    return compareNewestFirst(a, b);
+  });
+  return filtered.slice(0, options.limit ?? 100);
+}
+
+/* ------------------------------------------------------------------ pagination */
+
+export const FEED_PAGE_SIZE = 20;
+export const THREAD_PAGE_SIZE = 50;
+export const MAX_PAGE_SIZE = 100;
+export const CURSOR_PATTERN = /^[A-Za-z0-9_:.\-]{1,200}$/;
+
+export type Page<T> = { items: T[]; nextCursor: string | null; scanned: number };
+
+/**
+ * Cursor pagination over a stably ordered source with an in-memory visibility filter.
+ * `fetchBatch(after, size)` returns the next `size` raw items strictly after the cursor, in order.
+ * The cursor is the last item *scanned* (not the last returned), so filtered-out items are never
+ * re-read and every page continues exactly where the previous one stopped. `maxScan` bounds the work
+ * per request; a partial page still returns a cursor so "load more" can continue.
+ */
+export async function collectPage<T>(input: {
+  fetchBatch: (after: string | null, size: number) => Promise<T[]>;
+  accept: (item: T) => boolean;
+  cursorOf: (item: T) => string;
+  cursor: string | null;
+  limit: number;
+  batchSize?: number;
+  maxScan?: number;
+}): Promise<Page<T>> {
+  const limit = Math.max(1, Math.min(MAX_PAGE_SIZE * 2, Math.floor(input.limit)));
+  const batchSize = Math.max(limit, input.batchSize ?? limit * 2);
+  const maxScan = input.maxScan ?? 1000;
+  const items: T[] = [];
+  let after = input.cursor;
+  let scanned = 0;
+  for (;;) {
+    const batch = await input.fetchBatch(after, batchSize);
+    for (let index = 0; index < batch.length; index += 1) {
+      const item = batch[index];
+      scanned += 1;
+      after = input.cursorOf(item);
+      if (!input.accept(item)) continue;
+      items.push(item);
+      if (items.length === limit) {
+        const more = index < batch.length - 1 || batch.length === batchSize;
+        return { items, nextCursor: more ? after : null, scanned };
+      }
+    }
+    if (batch.length < batchSize) return { items, nextCursor: null, scanned };
+    if (scanned >= maxScan) return { items, nextCursor: after, scanned };
+  }
+}
+
+/** Newest first, ties broken by id (descending, code-unit order) to match Firestore's document-name ordering. */
+export function compareNewestFirst(a: { createdAt: string; id: string }, b: { createdAt: string; id: string }) {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+  return a.id === b.id ? 0 : a.id < b.id ? 1 : -1;
+}
+
+/** Comments sort by a key that is unique, time-ordered and scoped to one post, so a single-field range query pages a thread. */
+export function threadKey(postId: string, createdAt: string, commentId: string) {
+  return `${postId}__${createdAt}__${commentId}`;
+}
+
+export const feedQuerySchema = z.object({
+  space: z.string().min(1).max(128).optional(),
+  cursor: z.string().regex(CURSOR_PATTERN, "That page link is not valid.").optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(FEED_PAGE_SIZE),
+  filter: z.enum(["all", "saved"]).default("all"),
+  q: z.string().trim().max(120).optional(),
+});
+
+export const threadQuerySchema = z.object({
+  cursor: z.string().max(400).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(THREAD_PAGE_SIZE),
+});
+
+/* ------------------------------------------------------------------ safety: mute, block, rate limits */
+
+export const SAFETY_KINDS = ["mute", "block"] as const;
+export type SafetyKind = (typeof SAFETY_KINDS)[number];
+
+export function safetyDocId(uid: string, targetUid: string) {
+  return `${uid}__${targetUid}`;
+}
+
+/**
+ * Mute hides a member's posts, comments and notifications from you.
+ * Block does the same and also stops them replying to your posts or mentioning you.
+ * Moderators are never stopped from replying, so moderation keeps working.
+ */
+export function blockPreventsReply(kind: SafetyKind | null | undefined, replierRole: CommunityRole) {
+  return kind === "block" && !isModerator(replierRole);
+}
+
+export const DEFAULT_POSTING_LIMIT = { max: 10, windowMinutes: 10 };
+
+export type RateDecision = { allowed: boolean; retryAfterSeconds: number; timestamps: string[] };
+
+/** Sliding-window limiter over the member's recent post/comment times. Pure, so the window maths is tested. */
+export function applyRateLimit(timestamps: string[], now: Date, limit: { max: number; windowMinutes: number }): RateDecision {
+  const windowMs = limit.windowMinutes * 60_000;
+  const cutoff = now.getTime() - windowMs;
+  const recent = timestamps.filter((at) => Date.parse(at) > cutoff).sort();
+  if (recent.length >= limit.max) {
+    const oldest = Date.parse(recent[recent.length - limit.max]);
+    return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((oldest + windowMs - now.getTime()) / 1000)), timestamps: recent };
+  }
+  return { allowed: true, retryAfterSeconds: 0, timestamps: [...recent, now.toISOString()].slice(-Math.max(limit.max, 1)) };
+}
+
+export function rateLimitMessage(decision: Pick<RateDecision, "retryAfterSeconds">, limit: { max: number; windowMinutes: number }) {
+  const minutes = Math.ceil(decision.retryAfterSeconds / 60);
+  const wait = decision.retryAfterSeconds < 60 ? `${decision.retryAfterSeconds} seconds` : `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  return `You're posting too fast. This community allows ${limit.max} posts and replies per ${limit.windowMinutes} minutes. Try again in ${wait}.`;
+}
+
+/** Never send a removed post's content to someone who cannot moderate it. */
+export function redactPost(post: Post, role: CommunityRole): Post {
+  if (!post.removed || isModerator(role)) return post;
+  return { ...post, title: "Removed", body: "", mentions: [] };
+}
+
+export function searchPosts(posts: Post[], query: string) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+  return posts
+    .map((post) => {
+      const title = post.title.toLowerCase();
+      const body = post.body.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (!title.includes(term) && !body.includes(term)) return null;
+        score += title.includes(term) ? 3 : 1;
+      }
+      return { post, score };
+    })
+    .filter((entry): entry is { post: Post; score: number } => entry !== null)
+    .sort((a, b) => b.score - a.score || b.post.createdAt.localeCompare(a.post.createdAt))
+    .map((entry) => entry.post);
+}
+
+export function upcomingEvents(posts: Post[], now: Date) {
+  const cutoff = now.toISOString();
+  return posts
+    .filter((post) => post.event && !post.removed && (post.event.endsAt ?? post.event.startsAt) >= cutoff)
+    .sort((a, b) => (a.event!.startsAt).localeCompare(b.event!.startsAt));
+}
+
+/* ------------------------------------------------------------------ courses */
+
+export type Lesson = { id: string; title: string; body: string; unlockDay?: number };
+
+export type Course = {
+  id: string;
+  spaceId: string;
+  title: string;
+  description: string;
+  lessons: Lesson[];
+  dripByCohort?: boolean;
+  createdAt: string;
+};
+
+export type CourseProgress = {
+  courseId: string;
+  uid: string;
+  completedLessonIds: string[];
+  completedAt: string | null;
+  certificateId: string | null;
+};
+
+export function progressDocId(courseId: string, uid: string) {
+  return `${courseId}__${uid}`;
+}
+
+/** Progress only counts lessons that still exist, so deleting a lesson never leaves a course stuck below 100%. */
+export function courseProgress(course: Pick<Course, "lessons">, completedLessonIds: string[]) {
+  const ids = new Set(course.lessons.map((lesson) => lesson.id));
+  const completed = [...new Set(completedLessonIds)].filter((id) => ids.has(id)).length;
+  const total = ids.size;
+  return { completed, total, percent: total ? Math.round((completed / total) * 100) : 0, done: total > 0 && completed === total };
+}
+
+/**
+ * Applies a lesson completion toggle and issues a certificate the first time a member finishes
+ * every lesson. A certificate, once issued, is kept even if lessons are added later.
+ */
+export function applyLessonCompletion(
+  course: Pick<Course, "id" | "lessons">,
+  current: Pick<CourseProgress, "completedLessonIds" | "completedAt" | "certificateId"> | null,
+  input: { uid: string; lessonId: string; completed: boolean; now: string },
+) {
+  const before = new Set(current?.completedLessonIds ?? []);
+  if (input.completed) before.add(input.lessonId);
+  else before.delete(input.lessonId);
+  const completedLessonIds = [...before];
+  const { done } = courseProgress(course, completedLessonIds);
+  const certificateId = current?.certificateId ?? (done ? `cert_${course.id}_${input.uid}` : null);
+  const completedAt = current?.completedAt ?? (done ? input.now : null);
+  return { completedLessonIds, certificateId, completedAt, newlyCertified: !current?.certificateId && Boolean(certificateId) };
+}
+
+/* ------------------------------------------------------------------ calendar */
+
+function icsDate(iso: string) {
+  return new Date(iso).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+function icsText(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+}
+
+/** A single-event iCalendar file so members can add an event to any calendar app. Defaults to one hour. */
+export function buildEventIcs(input: {
+  id: string;
+  title: string;
+  description: string;
+  startsAt: string;
+  endsAt: string | null;
+  location: string;
+  url: string;
+  now: Date;
+}) {
+  const end = input.endsAt ?? new Date(new Date(input.startsAt).getTime() + 60 * 60 * 1000).toISOString();
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//SaaSassin//Community//EN",
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+    "BEGIN:VEVENT",
+    `UID:${input.id}@community.saasassin.net`,
+    `DTSTAMP:${icsDate(input.now.toISOString())}`,
+    `DTSTART:${icsDate(input.startsAt)}`,
+    `DTEND:${icsDate(end)}`,
+    `SUMMARY:${icsText(input.title)}`,
+    `DESCRIPTION:${icsText(input.description.slice(0, 1000))}`,
+    input.location ? `LOCATION:${icsText(input.location)}` : null,
+    `URL:${input.url}`,
+    "END:VEVENT",
+    "END:VCALENDAR",
+    "",
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\r\n");
+}
+
+/* ------------------------------------------------------------------ reactions + RSVPs */
+
+export function bookmarkDocId(postId: string, uid: string) {
+  return `${postId}__${uid}`;
+}
+
+/** Deterministic id: one reaction per user per type per post, so toggling is idempotent. */
+export function reactionDocId(postId: string, uid: string, type: ReactionType) {
+  return `${postId}__${uid}__${type}`;
+}
+
+export function rsvpDocId(postId: string, uid: string) {
+  return `${postId}__${uid}`;
+}
+
+/** Pure toggle: returns the next state and the count delta to apply atomically. */
+export function toggleReaction(exists: boolean, count: number | undefined) {
+  const current = Math.max(0, count ?? 0);
+  return exists
+    ? { active: false, delta: -1, count: Math.max(0, current - 1) }
+    : { active: true, delta: 1, count: current + 1 };
+}
+
+/* ------------------------------------------------------------------ reports */
+
+export type Report = {
+  id: string;
+  postId: string;
+  spaceId: string;
+  postTitle: string;
+  reporterUid: string;
+  reporterName: string;
+  reason: string;
+  status: "open" | "dismissed" | "actioned";
+  createdAt: string;
+};
+
+/** One report per member per post: re-reporting updates the reason instead of stacking duplicates. */
+export function reportDocId(postId: string, uid: string) {
+  return `${postId}__${uid}`;
+}
+
+/** The moderation queue: open reports in spaces the moderator can see, oldest first so nothing starves. */
+export function moderationQueue(reports: Report[], spaces: Space[], viewer: Viewer) {
+  if (!isModerator(viewer.role)) return [];
+  const visible = new Set(spaces.filter((space) => canSeeSpace(space, viewer)).map((space) => space.id));
+  return reports
+    .filter((report) => report.status === "open" && visible.has(report.spaceId))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export type Appeal = {
+  id: string;
+  postId: string;
+  spaceId: string;
+  postTitle: string;
+  authorUid: string;
+  authorName: string;
+  message: string;
+  removedReason: string | null;
+  status: "open" | "upheld" | "reinstated";
+  createdAt: string;
+};
+
+/** Only the author of a removed post may appeal, once per removal (a resolved appeal can be re-filed after a new removal). */
+export function canAppeal(post: Pick<Post, "authorUid" | "removed">, uid: string, existing: Pick<Appeal, "status"> | null) {
+  if (!post.removed || post.authorUid !== uid) return false;
+  return !existing || existing.status !== "open";
+}
+
+/** The appeal queue mirrors the report queue: open appeals in spaces the moderator can see, oldest first. */
+export function appealQueue(appeals: Appeal[], spaces: Space[], viewer: Viewer) {
+  if (!isModerator(viewer.role)) return [];
+  const visible = new Set(spaces.filter((space) => canSeeSpace(space, viewer)).map((space) => space.id));
+  return appeals
+    .filter((appeal) => appeal.status === "open" && visible.has(appeal.spaceId) && appeal.authorUid !== viewer.uid)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/** Who may remove whom: never the owner, never yourself, and only the owner removes admins. */
+export function canRemoveMember(actor: { uid: string; role: CommunityRole }, target: { uid: string; role: CommunityRole }) {
+  if (!isManager(actor.role) || actor.uid === target.uid || target.role === "owner") return false;
+  if (target.role === "admin") return actor.role === "owner";
+  return true;
+}
+
+export function summarizeRsvps(rsvps: { status: RsvpStatus }[]) {
+  const summary: Record<RsvpStatus, number> = { going: 0, maybe: 0, not_going: 0 };
+  for (const rsvp of rsvps) if (rsvp.status in summary) summary[rsvp.status] += 1;
+  return summary;
+}
+
+/**
+ * Attendance, defined explicitly: "attended" counts members a moderator checked in;
+ * the show-up rate is attended-who-said-going over everyone who said going.
+ */
+export function summarizeAttendance(rsvps: { status: RsvpStatus; attended?: boolean }[]) {
+  const going = rsvps.filter((rsvp) => rsvp.status === "going");
+  const attended = rsvps.filter((rsvp) => rsvp.attended === true).length;
+  const showedUp = going.filter((rsvp) => rsvp.attended === true).length;
+  return { going: going.length, attended, walkIns: attended - showedUp, showUpRate: going.length ? showedUp / going.length : null };
+}
+
+/* ------------------------------------------------------------------ invites */
+
+export const INVITE_CODE_PATTERN = /^[a-z0-9]{12,40}$/;
+
+export function generateInviteCode(random: (size: number) => Uint8Array) {
+  const alphabet = "abcdefghijkmnpqrstuvwxyz23456789";
+  return Array.from(random(20), (byte) => alphabet[byte % alphabet.length]).join("");
+}
+
+export type InviteCheck = { ok: true } | { ok: false; reason: "malformed" | "disabled" | "mismatch" };
+
+/** Validates a shareable invite code against the stored one, in constant time over equal lengths. */
+export function validateInviteCode(stored: { inviteCode?: string | null; inviteEnabled?: boolean } | null, provided: string): InviteCheck {
+  if (!INVITE_CODE_PATTERN.test(provided)) return { ok: false, reason: "malformed" };
+  if (!stored?.inviteCode || stored.inviteEnabled === false) return { ok: false, reason: "disabled" };
+  const expected = stored.inviteCode;
+  if (expected.length !== provided.length) return { ok: false, reason: "mismatch" };
+  let diff = 0;
+  for (let index = 0; index < expected.length; index += 1) diff |= expected.charCodeAt(index) ^ provided.charCodeAt(index);
+  return diff === 0 ? { ok: true } : { ok: false, reason: "mismatch" };
+}
+
+export const INVITE_ERRORS: Record<Exclude<InviteCheck, { ok: true }>["reason"], string> = {
+  malformed: "This invite link is not valid.",
+  disabled: "Invites to this community are turned off.",
+  mismatch: "This invite link has expired or was replaced.",
+};
+
+/* ------------------------------------------------------------------ mentions + notifications */
+
+/* Handles are chosen by each member, unique per community, and never derived from an email address. */
+export const HANDLE_PATTERN = /^[a-z0-9][a-z0-9_-]{1,28}[a-z0-9]$/;
+export const RESERVED_HANDLES = new Set([
+  "admin", "admins", "administrator", "owner", "owners", "moderator", "moderators", "mod", "mods", "staff", "support",
+  "team", "everyone", "here", "channel", "all", "community", "saasassin", "system", "root", "null", "undefined", "me", "you",
+]);
+
+export function normalizeHandle(input: string) {
+  return input.trim().replace(/^@+/, "").toLowerCase();
+}
+
+export type HandleCheck = { ok: true; handle: string } | { ok: false; error: string };
+
+export function validateHandle(input: string): HandleCheck {
+  const handle = normalizeHandle(input);
+  if (handle.length < 3) return { ok: false, error: "Handles need at least 3 characters." };
+  if (handle.length > 30) return { ok: false, error: "Handles can be at most 30 characters." };
+  if (!HANDLE_PATTERN.test(handle)) {
+    return { ok: false, error: "Use lowercase letters, numbers, hyphens or underscores, starting and ending with a letter or number." };
+  }
+  if (/[_-]{2}/.test(handle)) return { ok: false, error: "Handles cannot repeat hyphens or underscores." };
+  if (RESERVED_HANDLES.has(handle)) return { ok: false, error: "That handle is reserved." };
+  return { ok: true, handle };
+}
+
+/** A starting suggestion from the member's public name (never their email). The member still confirms it. */
+export function suggestHandle(name: string, taken: Set<string>) {
+  const base =
+    name
+      .normalize("NFKD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 24)
+      .replace(/-+$/g, "") || "member";
+  const padded = base.length < 3 ? `${base}-member`.slice(0, 24) : base;
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidate = attempt === 0 ? padded : `${padded}-${attempt + 1}`;
+    if (validateHandle(candidate).ok && !taken.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+// "@ada." ends a sentence and mentions ada; "@ada.lovelace" is a dotted name (or an email), not a mention.
+const MENTION_PATTERN = /(?:^|[^a-z0-9_@.-])@([a-z0-9][a-z0-9_-]{1,28}[a-z0-9])(?![a-z0-9_-]|\.[a-z0-9])/gi;
+
+export function mentionedHandles(text: string) {
+  return new Set(Array.from(text.matchAll(MENTION_PATTERN), (match) => match[1].toLowerCase()));
+}
+
+/** Mentions resolve only through chosen handles; members without one cannot be mentioned yet. */
+export function extractMentions(text: string, members: { uid: string; handle: string | null | undefined }[]) {
+  const handles = mentionedHandles(text);
+  return members.filter((member) => member.handle && handles.has(member.handle)).map((member) => member.uid);
+}
+
+export type Notification = {
+  id: string;
+  kind: "reply" | "mention";
+  postId: string;
+  postTitle: string;
+  actorName: string;
+  excerpt: string;
+  at: string;
+  unread: boolean;
+};
+
+/** In-app inbox computed from visible content: replies to my posts and mentions of me. */
+export function computeNotifications(input: {
+  uid: string;
+  posts: Post[];
+  comments: Comment[];
+  readAt: string | null;
+  limit?: number;
+}) {
+  const postsById = new Map(input.posts.map((post) => [post.id, post]));
+  const items: Notification[] = [];
+  const excerpt = (text: string) => (text.length > 120 ? `${text.slice(0, 117)}...` : text);
+  for (const post of input.posts) {
+    if (post.removed || post.authorUid === input.uid || !post.mentions.includes(input.uid)) continue;
+    items.push({ id: `post:${post.id}`, kind: "mention", postId: post.id, postTitle: post.title, actorName: post.authorName, excerpt: excerpt(post.body), at: post.createdAt, unread: false });
+  }
+  for (const comment of input.comments) {
+    const post = postsById.get(comment.postId);
+    if (!post || post.removed || comment.removed || comment.authorUid === input.uid) continue;
+    const kind = comment.mentions.includes(input.uid) ? "mention" : post.authorUid === input.uid ? "reply" : null;
+    if (!kind) continue;
+    items.push({ id: `comment:${comment.id}`, kind, postId: post.id, postTitle: post.title, actorName: comment.authorName, excerpt: excerpt(comment.body), at: comment.createdAt, unread: false });
+  }
+  return items
+    .map((item) => ({ ...item, unread: !input.readAt || item.at > input.readAt }))
+    .sort((a, b) => b.at.localeCompare(a.at))
+    .slice(0, input.limit ?? 50);
+}
+
+/* ------------------------------------------------------------------ input schemas */
+
+const text = (label: string, max: number) => z.string().trim().min(1, `${label} is required.`).max(max, `${label} is too long.`);
+
+export const spaceInputSchema = z.object({
+  name: text("Space name", 60),
+  description: z.string().trim().max(280).default(""),
+  kind: z.enum(SPACE_KINDS),
+  visibility: z.enum(SPACE_VISIBILITIES),
+  memberUids: z.array(z.string().min(1).max(128)).max(500).default([]),
+  cohortIds: z.array(z.string().min(1).max(128)).max(50).default([]),
+});
+
+export const eventInputSchema = z
+  .object({
+    startsAt: z.string().datetime({ offset: true, message: "Pick a valid start time." }),
+    endsAt: z.string().datetime({ offset: true }).nullable().default(null),
+    location: z.string().trim().max(200).default(""),
+  })
+  .refine((event) => !event.endsAt || event.endsAt > event.startsAt, { message: "The event must end after it starts." });
+
+export const actionSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("space.create"), space: spaceInputSchema }),
+  z.object({ type: z.literal("space.update"), spaceId: z.string().min(1), space: spaceInputSchema }),
+  z.object({ type: z.literal("space.move"), spaceId: z.string().min(1), direction: z.enum(["up", "down"]) }),
+  z.object({
+    type: z.literal("post.create"),
+    spaceId: z.string().min(1),
+    title: text("Title", 160),
+    body: text("Body", 10000),
+    event: eventInputSchema.nullable().default(null),
+  }),
+  z.object({ type: z.literal("comment.create"), postId: z.string().min(1), body: text("Comment", 4000) }),
+  z.object({ type: z.literal("reaction.toggle"), postId: z.string().min(1), reaction: z.enum(REACTION_TYPES) }),
+  z.object({ type: z.literal("rsvp.set"), postId: z.string().min(1), status: z.enum(RSVP_STATUSES) }),
+  z.object({
+    type: z.literal("post.moderate"),
+    postId: z.string().min(1),
+    operation: z.enum(["pin", "unpin", "close", "reopen", "remove", "restore"]),
+    reason: z.string().trim().max(280).default(""),
+  }),
+  z.object({ type: z.literal("comment.remove"), commentId: z.string().min(1), reason: z.string().trim().max(280).default("") }),
+  z.object({
+    type: z.literal("profile.update"),
+    displayName: text("Display name", 80),
+    headline: z.string().trim().max(120).default(""),
+    bio: z.string().trim().max(1000).default(""),
+  }),
+  z.object({ type: z.literal("profile.handle"), handle: z.string().trim().min(1, "Choose a handle.").max(40, "Handles can be at most 30 characters.") }),
+  z.object({ type: z.literal("member.role"), uid: z.string().min(1), role: z.enum(["admin", "moderator", "member"]) }),
+  z.object({ type: z.literal("member.remove"), uid: z.string().min(1) }),
+  z.object({ type: z.literal("bookmark.toggle"), postId: z.string().min(1) }),
+  z.object({ type: z.literal("course.create"), spaceId: z.string().min(1), title: text("Course title", 120), description: z.string().trim().max(1000).default("") }),
+  z.object({
+    type: z.literal("lesson.add"),
+    courseId: z.string().min(1),
+    title: text("Lesson title", 120),
+    body: text("Lesson content", 20000),
+    unlockDay: z.number().int().min(0).max(365).default(0),
+  }),
+  z.object({ type: z.literal("lesson.schedule"), courseId: z.string().min(1), lessonId: z.string().min(1), unlockDay: z.number().int().min(0, "Day 0 or later.").max(365, "At most day 365.") }),
+  z.object({ type: z.literal("course.drip"), courseId: z.string().min(1), dripByCohort: z.boolean() }),
+  z.object({ type: z.literal("cohort.create"), name: text("Cohort name", 60), startsAt: dateOnly }),
+  z.object({ type: z.literal("cohort.update"), cohortId: z.string().min(1), name: text("Cohort name", 60), startsAt: dateOnly }),
+  z.object({ type: z.literal("cohort.members"), cohortId: z.string().min(1), memberUids: z.array(z.string().min(1).max(128)).max(2000) }),
+  z.object({ type: z.literal("lesson.complete"), courseId: z.string().min(1), lessonId: z.string().min(1), completed: z.boolean() }),
+  z.object({
+    type: z.literal("plan.create"),
+    name: text("Plan name", 60),
+    description: z.string().trim().max(280).default(""),
+    priceLabel: z.string().trim().max(40).default(""),
+    spaceIds: z.array(z.string().min(1)).max(50).default([]),
+  }),
+  z.object({
+    type: z.literal("plan.update"),
+    planId: z.string().min(1),
+    name: text("Plan name", 60),
+    description: z.string().trim().max(280).default(""),
+    priceLabel: z.string().trim().max(40).default(""),
+    spaceIds: z.array(z.string().min(1)).max(50).default([]),
+  }),
+  z.object({
+    type: z.literal("plan.archive"),
+    planId: z.string().min(1),
+    existingAccess: z.enum(PLAN_ARCHIVE_CHOICES, { message: "Choose what happens to people who already hold this plan." }),
+    reason: z.string().trim().max(280).default(""),
+  }),
+  z.object({ type: z.literal("plan.unarchive"), planId: z.string().min(1) }),
+  z.object({ type: z.literal("entitlement.grant"), planId: z.string().min(1), uid: z.string().min(1), reason: z.string().trim().max(280).default("") }),
+  z.object({ type: z.literal("entitlement.revoke"), planId: z.string().min(1), uid: z.string().min(1), reason: z.string().trim().max(280).default("") }),
+  z.object({ type: z.literal("attendance.set"), postId: z.string().min(1), uid: z.string().min(1), attended: z.boolean() }),
+  z.object({ type: z.literal("post.appeal"), postId: z.string().min(1), message: text("Appeal", 1000) }),
+  z.object({
+    type: z.literal("appeal.resolve"),
+    appealId: z.string().min(1),
+    decision: z.enum(["upheld", "reinstated"]),
+    note: z.string().trim().max(280).default(""),
+  }),
+  z.object({ type: z.literal("post.report"), postId: z.string().min(1), reason: text("Reason", 280) }),
+  z.object({
+    type: z.literal("report.resolve"),
+    reportId: z.string().min(1),
+    resolution: z.enum(["dismissed", "actioned"]),
+    note: z.string().trim().max(280).default(""),
+  }),
+  z.object({ type: z.literal("safety.set"), targetUid: z.string().min(1).max(128), kind: z.enum(SAFETY_KINDS).nullable() }),
+  z.object({ type: z.literal("settings.posting_limit"), max: z.number().int().min(1, "Allow at least 1 post.").max(100, "At most 100.") }),
+  z.object({ type: z.literal("invite.rotate") }),
+  z.object({ type: z.literal("invite.toggle"), enabled: z.boolean() }),
+  z.object({ type: z.literal("notifications.read") }),
+]);
+
+export type CommunityAction = z.infer<typeof actionSchema>;
+
+export const joinSchema = z.object({
+  tenantId: z.string().min(1).max(128),
+  inviteCode: z.string().min(1).max(64),
+});
+
+export const memberInviteSchema = z.object({
+  email: z.string().trim().email("Enter a valid email."),
+  role: z.enum(["admin", "moderator", "member"]),
+});
+
+/* ------------------------------------------------------------------ export */
+
+export const EXPORT_FILES = [
+  ["settings", "community.settings"],
+  ["memberships", "community.membership"],
+  ["profiles", "community.profile"],
+  ["handles", "community.handle"],
+  ["spaces", "community.space"],
+  ["posts", "community.post"],
+  ["comments", "community.comment"],
+  ["reactions", "community.reaction"],
+  ["rsvps", "community.rsvp"],
+  ["reports", "community.report"],
+  ["bookmarks", "community.bookmark"],
+  ["blocks", "community.safety-preference"],
+  ["rateLimits", "community.rate-limit-window"],
+  ["appeals", "community.appeal"],
+  ["cohorts", "community.cohort"],
+  ["courses", "community.course"],
+  ["courseProgress", "community.course-progress"],
+  ["plans", "community.plan"],
+  ["entitlements", "community.entitlement"],
+  ["entitlementEvents", "community.entitlement-event"],
+  ["pendingInvites", "community.pending-invite"],
+  ["imports", "community.import-run"],
+  ["auditEvents", "community.audit-event"],
+] as const;
+
+export function exportSchemaName(schema: string) {
+  return `net.saasassin.${schema}@${EXPORT_SCHEMA_VERSION}`;
+}
+
+/** The invite secret is a credential, not community history; exports never carry it. */
+export function redactSettingsForExport(settings: Record<string, unknown>) {
+  const rest = { ...settings };
+  delete rest.inviteCode;
+  return { ...rest, inviteCodeRedacted: Boolean(settings.inviteCode) };
+}
